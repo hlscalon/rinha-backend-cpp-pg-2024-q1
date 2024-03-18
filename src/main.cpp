@@ -217,7 +217,13 @@ int main() {
 		return handleTransacao(clienteId, body, res);
 	});
 
-	int portNum = std::atoi(std::getenv("SERVER_PORT"));
+	char * serverPort = std::getenv("SERVER_PORT");
+	if (!serverPort) {
+		std::cerr << "Informe a porta do servidor via SERVER_PORT" << std::endl;
+		return -1;
+	}
+
+	int portNum = std::atoi(serverPort);
 	std::cout << "Servidor rodando em 0.0.0.0:" << portNum << std::endl;
 
 	server.listen("0.0.0.0", portNum);
