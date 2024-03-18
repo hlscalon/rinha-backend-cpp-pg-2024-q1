@@ -41,4 +41,3 @@ WORKDIR /usr/app
 COPY --from=build /usr/app .
 
 CMD ["/usr/app/server"]
-

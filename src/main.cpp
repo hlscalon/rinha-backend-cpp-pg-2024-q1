@@ -41,7 +41,7 @@ bool isValidClienteId(int id) {
 
 const pqxx::connection getConnection() {
 	static std::string dsn = std::format(
-		"dbname={} user={} password={} hostaddr={} port={}",
+		"dbname={} user={} password={} host={} port={}",
 		std::getenv("DB_NAME"),
 		std::getenv("DB_USER"),
 		std::getenv("DB_PASSWORD"),
@@ -73,10 +73,6 @@ httplib::Response handleExtrato(int clienteId, httplib::Response& res) {
 
 		json ultimasTransacoes;
 		for (auto row : result) {
-			if (nrow == 11) {
-				break;
-			}
-
 			if (nrow == 1) {
 				limiteAtual = row["limite_atual"].as<int>();
 				saldoAtual = row["saldo_atual"].as<int>();
@@ -91,6 +87,10 @@ httplib::Response handleExtrato(int clienteId, httplib::Response& res) {
 			ultimasTransacoes.push_back(transacao);
 
 			nrow++;
+		}
+
+		if (nrow > 1) {
+			ultimasTransacoes.erase(ultimasTransacoes.end() - 1);
 		}
 
 		txn.commit();
@@ -113,7 +113,7 @@ httplib::Response handleExtrato(int clienteId, httplib::Response& res) {
 		return respond(res, httplib::StatusCode::UnprocessableContent_422);
 	}
 
-	return respond(res, httplib::StatusCode::InternalServerError_500);
+	return respond(res, httplib::StatusCode::UnprocessableContent_422);
 }
 
 httplib::Response handleTransacao(int clienteId, const std::string & body, httplib::Response& res) {
@@ -165,6 +165,7 @@ httplib::Response handleTransacao(int clienteId, const std::string & body, httpl
 				std::make_format_args(
 					valorStr,
 					clienteIdStr,
+					valorStr,
 					clienteIdStr,
 					valorStr,
 					txn.quote(tipo),
@@ -174,6 +175,7 @@ httplib::Response handleTransacao(int clienteId, const std::string & body, httpl
 		}
 
 		auto [limite, saldo] = txn.query1<int, int>(query);
+		txn.commit();
 
 		json responseBody = {
 			{"saldo", saldo},
@@ -185,7 +187,7 @@ httplib::Response handleTransacao(int clienteId, const std::string & body, httpl
 		return respond(res, httplib::StatusCode::UnprocessableContent_422);
 	}
 
-	return respond(res, httplib::StatusCode::InternalServerError_500);
+	return respond(res, httplib::StatusCode::UnprocessableContent_422);
 }
 
 int main() {
@@ -194,7 +196,7 @@ int main() {
 	server.Get("/clientes/:id/extrato", [&](const httplib::Request& req, httplib::Response& res) {
 		auto clienteId = std::stoi(req.path_params.at("id"));
 		if (!isValidClienteId(clienteId)) {
-			return respond(res, httplib::StatusCode::UnprocessableContent_422);
+			return respond(res, httplib::StatusCode::NotFound_404);
 		}
 
 		return handleExtrato(clienteId, res);
@@ -203,7 +205,7 @@ int main() {
 	server.Post("/clientes/:id/transacoes", [&](const httplib::Request& req, httplib::Response& res, const httplib::ContentReader &content_reader) {
 		auto clienteId = std::stoi(req.path_params.at("id"));
 		if (!isValidClienteId(clienteId)) {
-			return respond(res, httplib::StatusCode::UnprocessableContent_422);
+			return respond(res, httplib::StatusCode::NotFound_404);
 		}
 
 		std::string body;
