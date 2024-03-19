@@ -97,7 +97,6 @@ httplib::Response handleExtrato(std::shared_ptr<DBPool> pool, int clienteId, htt
 	auto conn = pool->connection();
 
 	try {
-		// reinterpret_cast<pqxx::connection&>(*conn.get())
 		pqxx::work txn{*conn.get()};
 		pqxx::result result = txn.exec(
 			std::format(
@@ -155,8 +154,6 @@ httplib::Response handleExtrato(std::shared_ptr<DBPool> pool, int clienteId, htt
 		return respond(res, httplib::StatusCode::OK_200, responseBody);
 	} catch (pqxx::sql_error const &e) {
 		pool->freeConnection(conn);
-
-		return respond(res, httplib::StatusCode::UnprocessableContent_422);
 	} catch (...) {
 		pool->freeConnection(conn);
 	}
@@ -165,31 +162,38 @@ httplib::Response handleExtrato(std::shared_ptr<DBPool> pool, int clienteId, htt
 }
 
 httplib::Response handleTransacao(std::shared_ptr<DBPool> pool, int clienteId, const std::string & body, httplib::Response& res) {
-	json data = json::parse(body);
+	json data;
+	std::string tipo;
+	std::string descricao;
 
-	if (!data["valor"].is_number_unsigned()) {
-		return respond(res, httplib::StatusCode::UnprocessableContent_422);
-	}
+	try {
+		data = json::parse(body);
 
-	std::string tipo = data["tipo"].template get<std::string>();
-	if (tipo != "c" && tipo != "d") {
-		return respond(res, httplib::StatusCode::UnprocessableContent_422);
-	}
+		if (!data["valor"].is_number_unsigned()) {
+			return respond(res, httplib::StatusCode::UnprocessableContent_422);
+		}
 
-	std::string descricao = data["descricao"].template get<std::string>();
-	if (descricao == "") {
-		return respond(res, httplib::StatusCode::UnprocessableContent_422);
-	}
+		tipo = data["tipo"].template get<std::string>();
+		if (tipo != "c" && tipo != "d") {
+			return respond(res, httplib::StatusCode::UnprocessableContent_422);
+		}
 
-	int descricaoLen = descricao.length();
-	if (descricaoLen < 1 || descricaoLen > 10) {
+		descricao = data["descricao"].template get<std::string>();
+		if (descricao == "") {
+			return respond(res, httplib::StatusCode::UnprocessableContent_422);
+		}
+
+		int descricaoLen = descricao.length();
+		if (descricaoLen < 1 || descricaoLen > 10) {
+			return respond(res, httplib::StatusCode::UnprocessableContent_422);
+		}
+	} catch (...) {
 		return respond(res, httplib::StatusCode::UnprocessableContent_422);
 	}
 
 	auto conn = pool->connection();
 
 	try {
-		// reinterpret_cast<pqxx::connection&>(*conn.get())
 		pqxx::work txn{*conn.get()};
 
 		std::vector<std::string> params;
@@ -236,8 +240,6 @@ httplib::Response handleTransacao(std::shared_ptr<DBPool> pool, int clienteId, c
 		return respond(res, httplib::StatusCode::OK_200, responseBody);
 	} catch (pqxx::sql_error const &e) {
 		pool->freeConnection(conn);
-
-		return respond(res, httplib::StatusCode::UnprocessableContent_422);
 	} catch (...) {
 		pool->freeConnection(conn);
 	}
@@ -251,8 +253,9 @@ std::shared_ptr<DBPool> createPool() {
 	char * dbPassword = std::getenv("DB_PASSWORD");
 	char * dbHost = std::getenv("DB_HOST");
 	char * dbPort = std::getenv("DB_PORT");
+	char * dbPoolSize = std::getenv("DB_POOL_SIZE");
 
-	if (!dbName || !dbUser || !dbPassword || !dbHost || !dbPort) {
+	if (!dbName || !dbUser || !dbPassword || !dbHost || !dbPort || !dbPoolSize) {
 		throw std::runtime_error("Variáveis não informadas");
 	}
 
@@ -265,7 +268,7 @@ std::shared_ptr<DBPool> createPool() {
 		dbPort
 	);
 
-	int poolSize = 10;
+	int poolSize = std::atoi(dbPoolSize);
 	int retries = 1;
 
 	do {
