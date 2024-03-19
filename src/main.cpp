@@ -3,11 +3,65 @@
 #include <chrono>
 #include <pqxx/pqxx>
 #include <cstdlib>
+#include <mutex>
+#include <queue>
+#include <condition_variable>
+#include <memory>
 
 #include "libs/httplib.h"
 #include "libs/json.hpp"
 
 using json = nlohmann::json;
+
+class DBPool {
+public:
+	DBPool(std::string dsn, int poolSize = 10) {
+		createPool(dsn, poolSize);
+	}
+
+	std::shared_ptr<pqxx::connection> connection() {
+		std::unique_lock<std::mutex> lock(mutex_);
+
+		// se a pool está vazia, espera a notificação
+		while (pool_.empty()) {
+			condition_.wait(lock);
+		}
+
+		// pega uma conexão
+		std::shared_ptr<pqxx::connection> conn = pool_.front();
+
+		// remove da pool
+		pool_.pop();
+
+		return conn;
+	}
+
+	void freeConnection(std::shared_ptr<pqxx::connection> conn) {
+		std::unique_lock<std::mutex> lock_(mutex_);
+
+		// insere uma nova conexão na pool
+		pool_.push(conn);
+
+		// unlock no mutex
+		lock_.unlock();
+
+		// notifica a thread que está esperando
+		condition_.notify_one();
+	}
+
+private:
+	std::mutex mutex_;
+	std::condition_variable condition_;
+	std::queue<std::shared_ptr<pqxx::connection>> pool_;
+
+	void createPool(std::string dsn, int poolSize) {
+		std::lock_guard<std::mutex> locker(mutex_);
+
+		for (int i = 0; i < poolSize; i++) {
+			pool_.emplace(std::make_shared<pqxx::connection>(dsn));
+		}
+	}
+};
 
 constexpr std::string_view queryCreditar {
 	"WITH cliente_atualizado AS (UPDATE cliente SET saldo = saldo + {} WHERE id = {} RETURNING saldo, limite) "
@@ -39,23 +93,12 @@ bool isValidClienteId(int id) {
 	return id > 0 && id < 6;
 }
 
-const pqxx::connection getConnection() {
-	static std::string dsn = std::format(
-		"dbname={} user={} password={} host={} port={}",
-		std::getenv("DB_NAME"),
-		std::getenv("DB_USER"),
-		std::getenv("DB_PASSWORD"),
-		std::getenv("DB_HOST"),
-		std::getenv("DB_PORT")
-	);
+httplib::Response handleExtrato(std::shared_ptr<DBPool> pool, int clienteId, httplib::Response& res) {
+	auto conn = pool->connection();
 
-	return pqxx::connection{dsn};
-}
-
-httplib::Response handleExtrato(int clienteId, httplib::Response& res) {
 	try {
-		pqxx::connection conn = getConnection();
-		pqxx::work txn{conn};
+		// reinterpret_cast<pqxx::connection&>(*conn.get())
+		pqxx::work txn{*conn.get()};
 		pqxx::result result = txn.exec(
 			std::format(
 				"SELECT valor, tipo, descricao, realizada_em, limite_atual, saldo_atual "
@@ -94,6 +137,7 @@ httplib::Response handleExtrato(int clienteId, httplib::Response& res) {
 		}
 
 		txn.commit();
+		pool->freeConnection(conn);
 
 		json responseBody = {
 			{
@@ -110,13 +154,17 @@ httplib::Response handleExtrato(int clienteId, httplib::Response& res) {
 
 		return respond(res, httplib::StatusCode::OK_200, responseBody);
 	} catch (pqxx::sql_error const &e) {
+		pool->freeConnection(conn);
+
 		return respond(res, httplib::StatusCode::UnprocessableContent_422);
+	} catch (...) {
+		pool->freeConnection(conn);
 	}
 
 	return respond(res, httplib::StatusCode::UnprocessableContent_422);
 }
 
-httplib::Response handleTransacao(int clienteId, const std::string & body, httplib::Response& res) {
+httplib::Response handleTransacao(std::shared_ptr<DBPool> pool, int clienteId, const std::string & body, httplib::Response& res) {
 	json data = json::parse(body);
 
 	if (!data["valor"].is_number_unsigned()) {
@@ -138,13 +186,15 @@ httplib::Response handleTransacao(int clienteId, const std::string & body, httpl
 		return respond(res, httplib::StatusCode::UnprocessableContent_422);
 	}
 
+	auto conn = pool->connection();
+
 	try {
-		pqxx::connection conn = getConnection();
-		pqxx::work txn{conn};
+		// reinterpret_cast<pqxx::connection&>(*conn.get())
+		pqxx::work txn{*conn.get()};
 
 		std::vector<std::string> params;
 		std::string clienteIdStr = pqxx::to_string(clienteId);
-		std::string valorStr = pqxx::to_string(data["valor"].template get<int>()); 
+		std::string valorStr = pqxx::to_string(data["valor"].template get<int>());
 
 		std::string query;
 		if (tipo == "c") {
@@ -176,6 +226,7 @@ httplib::Response handleTransacao(int clienteId, const std::string & body, httpl
 
 		auto [limite, saldo] = txn.query1<int, int>(query);
 		txn.commit();
+		pool->freeConnection(conn);
 
 		json responseBody = {
 			{"saldo", saldo},
@@ -184,26 +235,70 @@ httplib::Response handleTransacao(int clienteId, const std::string & body, httpl
 
 		return respond(res, httplib::StatusCode::OK_200, responseBody);
 	} catch (pqxx::sql_error const &e) {
+		pool->freeConnection(conn);
+
 		return respond(res, httplib::StatusCode::UnprocessableContent_422);
+	} catch (...) {
+		pool->freeConnection(conn);
 	}
 
 	return respond(res, httplib::StatusCode::UnprocessableContent_422);
 }
 
+std::shared_ptr<DBPool> createPool() {
+	char * dbName = std::getenv("DB_NAME");
+	char * dbUser = std::getenv("DB_USER");
+	char * dbPassword = std::getenv("DB_PASSWORD");
+	char * dbHost = std::getenv("DB_HOST");
+	char * dbPort = std::getenv("DB_PORT");
+
+	if (!dbName || !dbUser || !dbPassword || !dbHost || !dbPort) {
+		throw std::runtime_error("Variáveis não informadas");
+	}
+
+	const std::string dsn = std::format(
+		"dbname={} user={} password={} host={} port={}",
+		dbName,
+		dbUser,
+		dbPassword,
+		dbHost,
+		dbPort
+	);
+
+	int poolSize = 10;
+	int retries = 1;
+
+	do {
+		std::cout << "Tentando conectar banco... tentativa " << retries << std::endl;
+
+		try {
+			return std::make_shared<DBPool>(dsn, poolSize);
+		} catch (...) {
+			retries++;
+
+			std::this_thread::sleep_for(std::chrono::seconds(5));
+		}
+
+	} while (retries < 20);
+
+	throw std::runtime_error("Erro ao obter conexão banco");
+}
+
 int main() {
+	std::shared_ptr<DBPool> pool = createPool();
 	httplib::Server server;
 
 	server.Get("/clientes/:id/extrato", [&](const httplib::Request& req, httplib::Response& res) {
-		auto clienteId = std::stoi(req.path_params.at("id"));
+		int clienteId = std::stoi(req.path_params.at("id"));
 		if (!isValidClienteId(clienteId)) {
 			return respond(res, httplib::StatusCode::NotFound_404);
 		}
 
-		return handleExtrato(clienteId, res);
+		return handleExtrato(pool, clienteId, res);
 	});
 
 	server.Post("/clientes/:id/transacoes", [&](const httplib::Request& req, httplib::Response& res, const httplib::ContentReader &content_reader) {
-		auto clienteId = std::stoi(req.path_params.at("id"));
+		int clienteId = std::stoi(req.path_params.at("id"));
 		if (!isValidClienteId(clienteId)) {
 			return respond(res, httplib::StatusCode::NotFound_404);
 		}
@@ -214,7 +309,7 @@ int main() {
 			return true;
 		});
 
-		return handleTransacao(clienteId, body, res);
+		return handleTransacao(pool, clienteId, body, res);
 	});
 
 	char * serverPort = std::getenv("SERVER_PORT");
